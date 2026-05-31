@@ -285,70 +285,64 @@ function saveSettings() {
 }
 
 // ========== Data Fetch ==========
-async function fetchKlines() {
+// 🔑 数据通过原生层 NativeAPI 获取（绕过 WebView CORS）
+function fetchKlines() {
   let interval = state.tf;
-  // 多数据源 fallback
-  let sources = [
-    { name: 'Binance', url: 'https://api.binance.com/api/v3/klines?symbol=' + state.symbol + '&interval=' + interval + '&limit=' + state.limit, parser: 'binance' },
-    { name: 'Binance2', url: 'https://api1.binance.com/api/v3/klines?symbol=' + state.symbol + '&interval=' + interval + '&limit=' + state.limit, parser: 'binance' },
-    { name: 'OKX', url: 'https://www.okx.com/api/v5/market/candles?instId=' + state.symbol.replace('USDT','-USDT') + '&bar=' + interval.replace('m','').replace('h','H').replace('d','D') + '&limit=' + state.limit, parser: 'okx' }
-  ];
-  
-  for (let src of sources) {
-    try {
-      let resp = await fetch(src.url, { signal: AbortSignal.timeout(8000) });
-      if (!resp.ok) continue;
-      let data = await resp.json();
-      
-      if (src.parser === 'binance') {
-        state.klines = data.map(k => ({
-          time: k[0] / 1000, open: parseFloat(k[1]), high: parseFloat(k[2]),
-          low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5])
-        }));
-      } else if (src.parser === 'okx') {
-        // OKX returns [ts,o,h,l,c,vol,...] in reverse order
-        data = data.data.reverse();
-        state.klines = data.map(k => ({
-          time: parseInt(k[0]) / 1000, open: parseFloat(k[1]), high: parseFloat(k[2]),
-          low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5])
-        }));
-      }
-      
-      if (state.klines.length > 0) {
-        state.currentPrice = state.klines[state.klines.length - 1].close;
-        updatePrice();
-        drawAll();
-        detectSignals();
-        return;
-      }
-    } catch(e) { console.log(src.name + ' failed:', e.message); }
+  if (typeof NativeAPI !== 'undefined') {
+    NativeAPI.fetchKlines(state.symbol, interval, state.limit);
+  } else {
+    // fallback: 浏览器直接 fetch（本地测试用）
+    fallbackFetchKlines();
   }
-  console.error('All data sources failed');
-  document.getElementById('mainPrice').textContent = '加载失败';
 }
 
-async function fetch24hTicker() {
-  let sources = [
-    { name: 'Binance', url: 'https://api.binance.com/api/v3/ticker/24hr?symbol=' + state.symbol, parser: 'binance' },
-    { name: 'Binance2', url: 'https://api1.binance.com/api/v3/ticker/24hr?symbol=' + state.symbol, parser: 'binance' },
-    { name: 'OKX', url: 'https://www.okx.com/api/v5/market/ticker?instId=' + state.symbol.replace('USDT','-USDT'), parser: 'okx' }
-  ];
-  for (let src of sources) {
-    try {
-      let resp = await fetch(src.url, { signal: AbortSignal.timeout(5000) });
-      if (!resp.ok) continue;
-      let d = await resp.json();
-      if (src.parser === 'binance') {
-        state.currentPrice = parseFloat(d.lastPrice);
-        state.change24h = parseFloat(d.priceChangePercent);
-      } else if (src.parser === 'okx') {
-        state.currentPrice = parseFloat(d.data[0].last);
-        state.change24h = parseFloat(d.data[0].open24h) ? ((parseFloat(d.data[0].last) - parseFloat(d.data[0].open24h)) / parseFloat(d.data[0].open24h) * 100) : 0;
-      }
-      updatePrice();
-      return;
-    } catch(e) {}
+// 原生层回调：接收 K线数据
+function onKlinesData(data) {
+  if (!Array.isArray(data) || data.length === 0) {
+    document.getElementById('mainPrice').textContent = '加载失败';
+    return;
   }
+  state.klines = data.map(k => ({
+    time: parseFloat(k[0]) / 1000, open: parseFloat(k[1]), high: parseFloat(k[2]),
+    low: parseFloat(k[3]), close: parseFloat(k[4]), volume: parseFloat(k[5])
+  }));
+  state.currentPrice = state.klines[state.klines.length - 1].close;
+  updatePrice();
+  drawAll();
+  detectSignals();
+}
+
+// 原生层回调：接收 24h 行情
+function onTickerData(data) {
+  if (data.lastPrice) {
+    state.currentPrice = parseFloat(data.lastPrice);
+    state.change24h = parseFloat(data.priceChangePercent) || 0;
+    updatePrice();
+  }
+}
+
+// 浏览器 fallback（本地开发测试用）
+async function fallbackFetchKlines() {
+  let interval = state.tf;
+  try {
+    let resp = await fetch('https://api.binance.com/api/v3/klines?symbol=' + state.symbol + '&interval=' + interval + '&limit=' + state.limit);
+    let data = await resp.json();
+    onKlinesData(data);
+  } catch(e) { console.error(e); }
+}
+
+function fetch24hTicker() {
+  if (typeof NativeAPI !== 'undefined') {
+    NativeAPI.fetchTicker(state.symbol);
+  } else {
+    fallbackFetchTicker();
+  }
+}
+async function fallbackFetchTicker() {
+  try {
+    let resp = await fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=' + state.symbol);
+    if (resp.ok) { let d = await resp.json(); onTickerData(d); }
+  } catch(e) {}
 }
 
 function updatePrice() {
@@ -843,18 +837,20 @@ async function autoAnalyze() {
     addAIMessage('⚠️ 请先在设置中填入OpenRouter API Key', 'assistant');
     return;
   }
-  
-  try {
-    let resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + state.apiKey },
-      body: JSON.stringify({ model: state.aiModel, messages: [{ role: 'user', content: context }], max_tokens: 1000 })
-    });
-    let data = await resp.json();
-    let reply = data.choices?.[0]?.message?.content || 'AI响应失败: ' + JSON.stringify(data.error || data);
-    addAIMessage(reply, 'assistant');
-  } catch(e) {
-    addAIMessage('❌ AI请求失败: ' + e.message, 'assistant');
+  // 通过原生层代理（绕过 CORS）
+  if (typeof NativeAPI !== 'undefined') {
+    window._aiCallback = function(reply) { addAIMessage(reply, 'assistant'); };
+    NativeAPI.aiChat(state.aiModel, state.apiKey, context);
+  } else {
+    try {
+      let resp = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + state.apiKey },
+        body: JSON.stringify({ model: state.aiModel, messages: [{ role: 'user', content: context }], max_tokens: 1000 })
+      });
+      let data = await resp.json();
+      addAIMessage(data.choices?.[0]?.message?.content || 'AI响应失败', 'assistant');
+    } catch(e) { addAIMessage('❌ 请求失败: ' + e.message, 'assistant'); }
   }
 }
 
@@ -899,6 +895,15 @@ function addAIMessage(text, role) {
 }
 
 // ========== Init ==========
+// 原生层 AI 回调
+function onAIData(jsonStr) {
+  try {
+    let data = JSON.parse(jsonStr);
+    let reply = data.choices?.[0]?.message?.content || data.error || 'AI响应: ' + jsonStr.slice(0,200);
+    if (window._aiCallback) { window._aiCallback(reply); window._aiCallback = null; }
+  } catch(e) { console.error(e); }
+}
+
 function init() {
   // Load settings
   document.getElementById('apiKey').value = state.apiKey;
